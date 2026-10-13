@@ -1,8 +1,9 @@
 ---
 name: forced-replay
 description: >-
-  Force-replay a saved LLM generation trajectory under runtime decode kernels to
-  recover its TRUE per-token logprobs / rank / entropy / top-k. Use when the user
+  Force-replay a saved LLM generation trajectory, either a basic single request
+  or an advanced full recorded agent session, under matching runtime paths to
+  recover and verify per-token logprobs / rank / entropy / top-k. Use when the user
   has a model plus a saved (ill/anomalous) trajectory — repetition loop, gibberish,
   divergence — and asks for faithful logprobs, trajectory rescoring, replay
   diagnosis: "force replay", "forced decode replay", "重放轨迹", "拿真实 logprobs",
@@ -10,7 +11,7 @@ description: >-
   outputs or live serving.
 ---
 
-# Forced decode-replay (runtime-faithful trajectory logprobs)
+# Forced replay: basic single-request and advanced full-session modes
 
 ## What & why
 
@@ -23,7 +24,22 @@ snapshot the PRE-MASK distribution — decode runs the runtime kernels, so the
 numbers are what the serving engine actually computed (validated bit-exact
 against online logprobs). Evidence and method details: `references/fidelity.md`.
 
-## Workflow
+## Choose the replay mode
+
+- **Basic / single request:** use `scripts/replay.py`; the single-request workflow and hard rules below apply to this mode.
+- **Advanced / full recorded agent session:** run `python -m validation.lab replay --run-dir <case-dir> --gpu <index>` from the source root. Capture actual per-request engine IDs and online raw logprobs, retain one matching offline engine with APC, and replay every full recorded prompt and forced output. Validate cache/compute ranges and effective configs before claiming fidelity. Operational instructions and executed CUDA/OpenCode acceptance evidence are in `validation/README.md` and `validation/REPORT.md`.
+- The advanced mode currently pins vLLM 0.26.0, V1 model runner, CUDA TP1 synchronous serial scheduling, and no speculation. It does not claim Ascend, concurrent batch, eviction/preemption, KV-byte, or activation equivalence. "Full" means the full request sequence, not universal serving-feature support. A successful forced token match alone is not numerical evidence.
+
+## Advanced full-session workflow
+
+1. Require a case directory containing `manifest.json` and the complete `online/engine.jsonl`, including every actual prompt/output token stream and the online raw logprob reference. Do not claim exact replay from client display text alone.
+2. Read the original effective configuration and ensure matching local model files and the supported CUDA/vLLM version. Use a new output directory; do not overwrite raw evidence or mix a warm unrelated cache into a cold-start case.
+3. Run `python -m validation.lab replay --run-dir <case-dir> --gpu <index>`. The driver initializes one engine, submits each recorded full prompt, lets APC reuse matching blocks, and forces the recorded outputs. It verifies the observed schedule; it does not force arbitrary production cache-eviction or batch plans.
+4. Require all four report gates: `token_match`, `cache_path_match`, `configuration_match`, and `numerical_match`. Probability measurements must precede the forcing mask; partial-prefill dummy samples must be excluded. Tools are not rerun offline.
+5. Optionally run the same case with `--mode rebuild-prefix` to quantify loss of cross-request prefix reuse. Its configuration/cache/numerical mismatch is intentional; compare its original-token logprob error against the online reference, not merely its forced token match.
+6. Report verified scope, configuration assumptions/mismatches, and artifact paths. Do not label KV-byte equality, activation fidelity, fault attribution, or general production reproducibility as verified unless independently measured.
+
+## Basic single-request workflow
 
 1. **Collect inputs** (ask the user; never guess silently):
    - model path (same weights as deployment);
@@ -63,7 +79,7 @@ against online logprobs). Evidence and method details: `references/fidelity.md`.
    worst steps, and the diagnosis per `references/interpretation.md`. Attach the
    `.meta.json` sidecar (or its contents) so the result is auditable.
 
-## Hard rules
+## Hard rules (single-request `scripts/replay.py` mode)
 
 - Engine args MUST match the deployment (step 2). A mismatch produces confident
   wrong numbers, not an error.

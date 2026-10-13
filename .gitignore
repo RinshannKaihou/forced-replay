@@ -3,3 +3,5 @@ __pycache__/
 *.npz
 *.meta.json
 .DS_Store
+validation/runs/
+.pytest_cache/
