@@ -110,3 +110,42 @@ def test_online_observer_does_not_modify_logits():
     proc.update_state(BatchUpdate(1, [], [(0, SamplingParams(), [7], [])], []))
     logits = torch.tensor([[1., -2., 3.]])
     assert torch.equal(proc.apply(logits.clone()), logits)
+
+
+@pytest.mark.parametrize("fields,expected_status", [
+    ({"stop": "END"}, 400),
+    ({"stop": ["END"]}, 400),
+    ({"stop": ["END", "HALT"]}, 400),
+    ({"stop": None}, 200),
+    ({"stop": []}, 200),
+    ({"stop": ""}, 200),
+    ({"stop_token_ids": [2]}, 200),
+])
+def test_api_stop_string_scope_is_checked_before_forwarding(tmp_path, monkeypatch, fields, expected_status):
+    module = implementation()
+    from fastapi import FastAPI, Request
+    from fastapi.testclient import TestClient
+    import json
+    monkeypatch.setenv("FORCED_REPLAY_TRACE_DIR", str(tmp_path))
+    app, received = FastAPI(), []
+    async def echo(request: Request):
+        value = await request.json()
+        received.append(value)
+        return value
+    app.add_api_route("/v1/chat/completions", echo, methods=["POST"])
+    app.add_middleware(module.CaptureMiddleware)
+    with TestClient(app) as client:
+        result = client.post("/v1/chat/completions",
+                             json={"messages": [{"role": "user", "content": "hello"}], **fields})
+    assert result.status_code == expected_status
+    rows = [json.loads(line) for line in (tmp_path / "api.jsonl").read_text(encoding="utf-8").splitlines()]
+    if expected_status == 400:
+        reason = "stop strings are outside stage-1 capture scope"
+        assert result.json()["error"] == {"type": "capture_scope_error", "message": reason}
+        assert not received
+        assert len(rows) == 1 and rows[0]["kind"] == "api_rejection" and rows[0]["reason"] == reason
+    else:
+        # Only the middleware scope gate is tested; native API validation is unchanged.
+        assert len(received) == 1
+        assert all(received[0][key] == value for key, value in fields.items())
+        assert rows[0]["kind"] == "api_request"

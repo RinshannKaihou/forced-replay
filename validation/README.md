@@ -59,6 +59,8 @@ cd /workspace/inference_error_debugging_practice/prefill_decode_fidelity/forced-
 
 实验室仅支持 `POST /v1/chat/completions` 文本生成；GET/HEAD/OPTIONS 原样透传（含 health/model 查询），其它修改状态的 HTTP 路由及 WebSocket 不进入引擎。其它生成接口、`n>1`、prompt logprobs、结构化生成/受约束 tool_choice 和多模态输入会返回明确的 HTTP 400（WebSocket 1008），不应拿该实验服务代替通用生产 API。正常 `tool_choice=auto/none` 工具调用仍受支持。
 
+非空 `stop` 字符串或列表返回 HTTP 400，不转交引擎：vLLM 前端检测到停止字符串时，客户端可正常收到 `stop`，但引擎会被通知 `abort`，当前阶段不支持关联这两种终态。未设置、`null` 和空列表继续原请求校验；`stop_token_ids` 不受这条新增限制影响。以后支持停止字符串时，需要关联前端终止原因，而不是把所有引擎 `abort` 当成正常停止。
+
 JSON 容器最大嵌套深度为 64（根容器算 1）；超限/递归错误在解析、编码和记录之前返回 HTTP 400，记录拒绝原因，不转交引擎。正常工具 schema 不受影响。
 
 客户端的 `vllm_xargs.forced_ids` / `trace_id` 是保留字段，HTTP 400 拒绝；在线真实 worker 即使遇到这类参数也不会 forcing。离线仅由 driver 的 `FORCED_REPLAY_MODE=replay` 开启 forcing，参数先在前端校验。采集模式是 identity；原始与注入 trace ID 后的有效请求分别保存。
@@ -69,7 +71,7 @@ JSON 容器最大嵌套深度为 64（根容器算 1）；超限/递归错误在
 
 环境策略 `controlled-vllm-whitelist-v1`：serve 和 replay 都清除继承的所有 `VLLM_*`，只恢复 `validation.lab.RUNTIME_ENVIRONMENT_KEYS` 列出的布尔开关，另显式设置禁用插件/usage stats。白名单值仅接受原样的 `"0"` / `"1"` 或未设置；不把 `true/false` 文本猜测转换，因为固定版本的部分开关用 `int()` 解析。白名单涵盖 batch-invariant、runner、Triton TD、FlashInfer sampler、DeepGEMM/E8M0/TMA、AWQ、Marlin atomic-add 和 breakable-cudagraph；未设置的值以 `null` 记录并在重放时保持未设置。**非白名单设置（包括 `VLLM_ATTENTION_BACKEND` 和任何鉴权/路径变量）在这套受控实验室中不继承**，采用固定版本默认值或显式 engine kwargs，不宣称复刻任意生产 shell。日志不能保存 API key。旧 manifest 没有环境证据时标记 `unknown`，仍产生诊断报告，但正式模式不通过配置验收。
 
-离线每轮提交记录下来的完整 prompt IDs，不从客户端显示文本拼接历史；只强制模型输出，不重新执行工具。`stop`/EOS 在离线显式改为按已记录长度结束，避免少掉最后一个引擎 token；原终止原因仍保留在 case 中。
+离线每轮提交记录下来的完整 prompt IDs，不从客户端显示文本拼接历史；只强制模型输出，不重新执行工具。停止 token ID/EOS 在离线显式改为按已记录长度结束，避免少掉最后一个引擎 token；原终止原因仍保留在 case 中。前端停止字符串仍属于上面明确拒绝的采集范围。
 
 ### 实际遇到并覆盖的边界
 

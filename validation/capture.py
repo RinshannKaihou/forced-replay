@@ -278,6 +278,8 @@ class CaptureMiddleware:
             return await self.reject(scope, receive, send, "trace_id and forced_ids are reserved server fields")
         if original.get("n", 1) != 1 or original.get("prompt_logprobs") is not None:
             return await self.reject(scope, receive, send, "capture requires one sequence and no prompt_logprobs")
+        if original.get("stop"):
+            return await self.reject(scope, receive, send, "stop strings are outside stage-1 capture scope")
         if original.get("response_format") is not None or original.get("structured_outputs") is not None:
             return await self.reject(scope, receive, send, "structured generation is outside stage-1 capture scope")
         if original.get("tool_choice", "auto") not in (None, "auto", "none"):
