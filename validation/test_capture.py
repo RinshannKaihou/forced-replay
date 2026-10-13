@@ -88,6 +88,7 @@ def test_partial_prefill_dummy_sampling_is_not_measured_or_forced(tmp_path, monk
     module = implementation()
     import json
     monkeypatch.setenv("FORCED_REPLAY_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("FORCED_REPLAY_MODE", "replay")
     active = tmp_path / "active"
     active.mkdir()
     state = active / "chunked.json"

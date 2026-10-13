@@ -21,14 +21,14 @@ def main():
     version = subprocess.check_output([args.binary, "--version"], env=prepared["env"], text=True).strip()
     # OpenCode v2 debug config uses its managed service even with isolated XDG paths.
     # Only `run --standalone` is permitted here; keep the generated config as the audit record.
-    (root / "user-turns.json").write_text(json.dumps(prompts, indent=2) + "\n")
+    (root / "user-turns.json").write_text(json.dumps(prompts, indent=2) + "\n", encoding="utf-8")
     results, session = [], None
     for index, prompt in enumerate(prompts):
         stdout, stderr = root / f"turn-{index+1}.jsonl", root / f"turn-{index+1}.stderr"
         command = turn_command(args.binary, args.model, prompt, session)
         print(f"[agent] turn={index+1} session={session or 'new'}", flush=True)
         run_process(command, prepared, stdout, stderr, args.timeout)
-        raw = stdout.read_text()
+        raw = stdout.read_text(encoding="utf-8")
         event_sessions = {json.loads(line).get("sessionID") for line in raw.splitlines() if line.strip()}
         if len(event_sessions) != 1 or not all(isinstance(s, str) and s.startswith("ses_") for s in event_sessions):
             raise ValueError("missing or inconsistent CLI session IDs")
@@ -38,11 +38,11 @@ def main():
                     exported, root / f"turn-{index+1}.export.stderr", 30)
         result = analyze_events(raw, prepared["workspace"], expected_session=session,
             required_file=("inventory.txt", "policy.txt", None)[index],
-            session_export=json.loads(exported.read_text()))
+            session_export=json.loads(exported.read_text(encoding="utf-8")))
         session = result["session_id"]
         results.append(result)
         (root / "session.json").write_text(json.dumps(dict(version=version, session_id=session,
-            user_turns=len(results), turns=results, base_url=args.base_url, model=args.model), indent=2) + "\n")
+            user_turns=len(results), turns=results, base_url=args.base_url, model=args.model), indent=2) + "\n", encoding="utf-8")
         print(f"[agent] completed turn={index+1} executed_tools={len(result['tool_calls'])}", flush=True)
     calls = [call for turn in results for call in turn["tool_calls"]]
     if len(calls) < 2:

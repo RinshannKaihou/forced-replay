@@ -19,6 +19,7 @@ import vllm
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.sample.logits_processor import LogitsProcessor
 from vllm.v1.sample.logits_processor.interface import MoveDirectionality
+from validation.serialization import json_safe
 
 
 def append(filename, event):
@@ -30,7 +31,7 @@ def append(filename, event):
     record = dict(event, timestamp_ns=time.time_ns(), pid=os.getpid())
     with path.open("a", encoding="utf-8") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
-        handle.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+        handle.write(json.dumps(json_safe(record), ensure_ascii=False, allow_nan=False) + "\n")
         handle.flush()
 
 
@@ -46,7 +47,10 @@ def json_config(config):
         return {field.name: json_config(getattr(config, field.name)) for field in dataclasses.fields(config)}
     if isinstance(config, dict):
         return {str(key): json_config(value) for key, value in config.items()}
-    if isinstance(config, (list, tuple, set)):
+    if isinstance(config, (set, frozenset)):
+        values = [json_config(value) for value in config]
+        return sorted(values, key=lambda value: json.dumps(json_safe(value), sort_keys=True, ensure_ascii=False))
+    if isinstance(config, (list, tuple)):
         return [json_config(value) for value in config]
     if config is None or isinstance(config, (str, int, float, bool)):
         return config
@@ -61,6 +65,7 @@ class TraceScheduler(Scheduler):
             raise RuntimeError(f"validation adapter pins vLLM 0.26.0, got {vllm.__version__}")
         super().__init__(*args, **kwargs)
         self._trace_cache = {}
+        self._trace_hash_counts = {}
         config = args[0] if args else kwargs["vllm_config"]
         append("engine.jsonl", {"kind": "engine", "vllm_version": vllm.__version__,
                                 "torch_version": torch.__version__, "config": json_config(config)})
@@ -84,17 +89,23 @@ class TraceScheduler(Scheduler):
             start = end - count  # super.schedule already advances computed-token count.
             self._trace_cache.setdefault(rid, start)
             extra = req.sampling_params.extra_args or {}
-            if extra.get("forced_ids") is not None:
+            if os.environ.get("FORCED_REPLAY_MODE") == "replay" and extra.get("forced_ids") is not None:
                 if batch_size != 1 or self.scheduler_config.async_scheduling:
                     raise ValueError("measurement sidecar requires synchronous serial scheduling")
                 path = active_path(extra["trace_id"])
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps(dict(request_id=rid, start=start, end=end,
-                                                 prompt_length=req.num_prompt_tokens)))
+                                                 prompt_length=req.num_prompt_tokens)), encoding="utf-8")
+            previous = self._trace_hash_counts.get(rid, 0)
+            reset = len(req.block_hashes) < previous
+            if reset:
+                previous = 0
+            hashes = [bytes(h).hex() for h in req.block_hashes[previous:]]
+            self._trace_hash_counts[rid] = len(req.block_hashes)
             append("engine.jsonl", dict(kind="schedule", request_id=rid, start=start, end=end,
                 prompt_length=req.num_prompt_tokens, cached_tokens=self._trace_cache[rid],
                 preemptions=req.num_preemptions, batch_size=batch_size,
-                block_hashes=[bytes(h).hex() for h in req.block_hashes]))
+                block_hash_start=previous, new_block_hashes=hashes, block_hash_reset=reset))
         return output
 
     def update_from_output(self, *args, **kwargs):
@@ -112,13 +123,41 @@ class TraceScheduler(Scheduler):
                     stop_reason=output.stop_reason, num_nans=output.num_nans_in_logits))
                 if output.finish_reason is not None:
                     self._trace_cache.pop(output.request_id, None)
+                    self._trace_hash_counts.pop(output.request_id, None)
         return result
+
+    def finish_requests(self, request_ids, finished_status):
+        finished = super().finish_requests(request_ids, finished_status)
+        for request in finished:
+            reason = request.get_finished_reason()
+            append("engine.jsonl", dict(kind="finish", request_id=request.request_id,
+                finish_reason=str(reason) if reason is not None else None,
+                stop_reason=request.stop_reason, finished_status=finished_status.name,
+                n_output=request.num_output_tokens, termination_source="scheduler.finish_requests"))
+            self._trace_cache.pop(request.request_id, None)
+            self._trace_hash_counts.pop(request.request_id, None)
+        return finished
 
 
 class ReplayProcessor(LogitsProcessor):
     def __init__(self, vllm_config, device, is_pin_memory):
         self.rows = {}
         self.require_schedule = vllm_config is not None
+        # None is used only by CPU unit fixtures; real vLLM supplies its config.
+        self.allow_forcing = vllm_config is None or os.environ.get("FORCED_REPLAY_MODE") == "replay"
+
+    @classmethod
+    def validate_params(cls, params):
+        extra = params.extra_args or {}
+        if "forced_ids" not in extra:
+            return
+        if os.environ.get("FORCED_REPLAY_MODE") != "replay":
+            raise ValueError("internal forcing is permitted only in offline replay")
+        trace_id, forced = extra.get("trace_id"), extra["forced_ids"]
+        if not isinstance(trace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", trace_id):
+            raise ValueError("offline forcing requires a safe server trace_id")
+        if not isinstance(forced, list) or not forced or any(type(t) is not int or t < 0 for t in forced):
+            raise ValueError("forced_ids must be a nonempty list of nonnegative token IDs")
 
     def is_argmax_invariant(self):
         return False  # Identity online, deliberately non-invariant when forcing offline.
@@ -130,7 +169,7 @@ class ReplayProcessor(LogitsProcessor):
             self.rows.pop(idx, None)
         for idx, params, _prompt, output_ref in update.added:
             extra = params.extra_args or {}
-            forced = extra.get("forced_ids")
+            forced = extra.get("forced_ids") if self.allow_forcing else None
             if forced is None:
                 self.rows.pop(idx, None)
             else:
@@ -149,7 +188,7 @@ class ReplayProcessor(LogitsProcessor):
     def apply(self, logits):
         for idx, (forced, output_ref, trace_id) in self.rows.items():
             if self.require_schedule:
-                scheduled = json.loads(active_path(trace_id).read_text())
+                scheduled = json.loads(active_path(trace_id).read_text(encoding="utf-8"))
                 if scheduled["end"] < scheduled["prompt_length"]:
                     # vLLM samples dummy logits for partial prefill and discards them.
                     # They are not output-token probabilities and must not be forced.
@@ -167,13 +206,37 @@ class ReplayProcessor(LogitsProcessor):
             k = min(20, logp.numel())
             top = torch.topk(logp, k)
             entropy = -(logp.exp() * torch.where(torch.isfinite(logp), logp, 0)).sum()
+            invalid_distribution = bool(torch.isnan(logp).any() | torch.isposinf(logp).any())
             append("measurements.jsonl", dict(kind="measurement", trace_id=trace_id, step=step,
                 forced_id=token, forced_logprob=float(logp[token]),
-                forced_rank=int((logp > logp[token]).sum()), entropy=float(entropy),
+                forced_rank=-1 if invalid_distribution else int((logp > logp[token]).sum()),
+                distribution_valid=not invalid_distribution, entropy=float(entropy),
                 topk_ids=top.indices.tolist(), topk_logprobs=top.values.tolist()))
             logits[idx].fill_(-1e30)
             logits[idx, token] = 0
         return logits
+
+
+# Count the root container as depth 1; leave recursion headroom for trace wrappers
+# and json_safe's recursive normalization while allowing ordinary tool schemas.
+MAX_JSON_DEPTH = 64
+
+
+def reject_non_json_constant(token):
+    raise ValueError(f"nonstandard JSON number: {token}")
+
+
+def validate_json_depth(value):
+    """Bound decoded object/array nesting without recursive validation."""
+    stack = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if not isinstance(item, (dict, list)):
+            continue
+        if depth > MAX_JSON_DEPTH:
+            raise ValueError(f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}")
+        children = item.values() if isinstance(item, dict) else item
+        stack.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
 
 
 class CaptureMiddleware:
@@ -182,8 +245,12 @@ class CaptureMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("path") != "/v1/chat/completions":
+        if scope["type"] == "websocket":
+            return await send({"type": "websocket.close", "code": 1008})
+        if scope["type"] != "http" or scope["method"] in ("GET", "HEAD", "OPTIONS"):
             return await self.app(scope, receive, send)
+        if scope["method"] != "POST" or scope["path"] != "/v1/chat/completions":
+            return await self.reject(scope, receive, send, "capture supports only POST /v1/chat/completions")
         body = bytearray()
         while True:
             message = await receive()
@@ -192,16 +259,52 @@ class CaptureMiddleware:
             body.extend(message.get("body", b""))
             if not message.get("more_body", False):
                 break
-        original = json.loads(body)
+        try:
+            original = json.loads(body, parse_constant=reject_non_json_constant)
+        except RecursionError:
+            return await self.reject(scope, receive, send, f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}")
+        except (ValueError, UnicodeDecodeError):
+            return await self.reject(scope, receive, send, "invalid JSON request body")
+        try:
+            validate_json_depth(original)
+        except ValueError as exc:
+            return await self.reject(scope, receive, send, str(exc))
+        if not isinstance(original, dict):
+            return await self.reject(scope, receive, send, "request must be a JSON object")
+        extra = original.get("vllm_xargs")
+        if extra is not None and not isinstance(extra, dict):
+            return await self.reject(scope, receive, send, "vllm_xargs must be an object")
+        if {"trace_id", "forced_ids"}.intersection(extra or {}):
+            return await self.reject(scope, receive, send, "trace_id and forced_ids are reserved server fields")
+        if original.get("n", 1) != 1 or original.get("prompt_logprobs") is not None:
+            return await self.reject(scope, receive, send, "capture requires one sequence and no prompt_logprobs")
+        if original.get("response_format") is not None or original.get("structured_outputs") is not None:
+            return await self.reject(scope, receive, send, "structured generation is outside stage-1 capture scope")
+        if original.get("tool_choice", "auto") not in (None, "auto", "none"):
+            return await self.reject(scope, receive, send, "constrained tool_choice is outside stage-1 capture scope")
+        if not isinstance(original.get("messages", []), list):
+            return await self.reject(scope, receive, send, "messages must be an array")
+        for message in original.get("messages", []):
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list) and any(not isinstance(item, dict) or item.get("type") != "text" for item in content):
+                return await self.reject(scope, receive, send, "multimodal input is outside stage-1 capture scope")
+        if original.get("prompt_embeds") is not None:
+            return await self.reject(scope, receive, send, "embedding input is outside stage-1 capture scope")
         effective = dict(original)
         trace_id = uuid.uuid4().hex
-        effective["vllm_xargs"] = dict(original.get("vllm_xargs") or {}, trace_id=trace_id)
+        effective["vllm_xargs"] = dict(extra or {}, trace_id=trace_id)
         effective.update(logprobs=True, top_logprobs=20, return_token_ids=True)
-        if effective.get("prompt_logprobs") is not None:
-            raise ValueError("prompt_logprobs would change prefix-cache reads")
-        append("api.jsonl", dict(kind="api_request", trace_id=trace_id,
-                                 original=original, effective=effective))
-        encoded = json.dumps(effective).encode()
+        try:
+            encoded = json.dumps(effective, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except RecursionError:
+            return await self.reject(scope, receive, send, f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}")
+        except (ValueError, UnicodeError):
+            return await self.reject(scope, receive, send, "request must contain valid UTF-8 and finite JSON numbers")
+        try:
+            append("api.jsonl", dict(kind="api_request", trace_id=trace_id,
+                                     original=original, effective=effective))
+        except RecursionError:
+            return await self.reject(scope, receive, send, f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}")
         scope = dict(scope)
         scope["headers"] = [(k, v) for k, v in scope["headers"] if k.lower() != b"content-length"]
         scope["headers"].append((b"content-length", str(len(encoded)).encode()))
@@ -223,3 +326,9 @@ class CaptureMiddleware:
             await send(message)
 
         return await self.app(scope, replacement_receive, recording_send)
+
+    async def reject(self, scope, receive, send, message):
+        from starlette.responses import JSONResponse
+        append("api.jsonl", dict(kind="api_rejection", path=scope["path"], reason=message))
+        response = JSONResponse({"error": {"type": "capture_scope_error", "message": message}}, status_code=400)
+        await response(scope, receive, send)

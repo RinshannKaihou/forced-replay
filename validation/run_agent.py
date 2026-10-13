@@ -141,13 +141,21 @@ def run_process(command, prepared, stdout_path, stderr_path, timeout):
         try:
             code = process.wait(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
             raise RuntimeError(f"command interrupted or timed out after {timeout}s; see {stdout_path} and {stderr_path}") from None
+        finally:
+            # This new session is ours, including descendants left by an exited
+            # parent. Reaping the parent does not prove its process group is gone.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
     if code:
         raise RuntimeError(f"command exited {code}; see {stdout_path} and {stderr_path}")
 
@@ -189,7 +197,7 @@ def analyze_events(raw, workspace, expected_session=None, required_file=None, se
         if path not in {workspace / "inventory.txt", workspace / "policy.txt"}:
             raise ValueError("read event accessed a non-fixture file")
         output = state.get("output", "")
-        if not isinstance(output, str) or not all(line in output for line in path.read_text().splitlines()):
+        if not isinstance(output, str) or not all(line in output for line in path.read_text(encoding="utf-8").splitlines()):
             raise ValueError("completed read output does not contain the fixture contents")
         identity = (part.get("messageID"), part.get("id"))
         if not all(identity):

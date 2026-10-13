@@ -15,7 +15,7 @@
 
 ## 高级版：采集、重放和消融
 
-完整操作及边界说明见 [`validation/README.md`](validation/README.md)，真实验收结果见 [`validation/REPORT.md`](validation/REPORT.md)。在项目根目录执行，并为每次实验使用新的 run-dir。
+完整操作及边界说明见 [`validation/README.md`](validation/README.md)，真实验收结果见 [`validation/REPORT.md`](validation/REPORT.md)，PR #1 整改与独立复验见 [`validation/PR1_REVIEW_FIXES.md`](validation/PR1_REVIEW_FIXES.md)。在项目根目录执行，并为每次实验使用新的 run-dir。
 
 ```bash
 # 终端 A：本地服务；只监听 loopback。
@@ -55,7 +55,9 @@ python scripts/replay.py --model /path/to/model --traj traj.json --quantization 
 
 产物：`<traj>_replay.npz`（逐步测量）和 `<traj>_replay.meta.json`（引擎配置）。模型、quantization、dtype、TP、图执行与 chunked-prefill 等参数必须与原部署匹配。
 
-基础版要求 vLLM 0.26.x、CUDA GPU；LogitsProcessor 协议强绑定，其他版本需先按 [`references/fidelity.md`](references/fidelity.md) 适配。共享 GPU 可自动选卡。原基础版脚本未随本次高级版提交修改，不应假设高级版的 partial-prefill 测量防护也已应用于旧脚本。
+基础版要求 vLLM 0.26.x、CUDA GPU；LogitsProcessor 协议强绑定，其他版本需先按 [`references/fidelity.md`](references/fidelity.md) 适配。共享 GPU 可自动选卡。
+
+**旧基础脚本的已知限制：** 仅使用 TP1、固定单请求 batch slot、无抢占且不触发 partial-prefill 的轨迹。prompt 超过原部署的单次 prefill token budget 时，会记录重复的 `step=0` 并以 `[error] record count mismatch` 失败；其 UNIDIRECTIONAL row move 仍按交换处理，所以不能用于发生该类重排的轨迹。原脚本本次未改，不宣称上述情况可用。需要长 prompt 或多请求重放时，先按高级模式采集 case，再使用高级入口；**不要通过改变原部署的 chunk size 绕过错误后声称保真。**
 
 ## 作为 Claude Code skill 安装
 

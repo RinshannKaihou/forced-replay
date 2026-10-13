@@ -59,3 +59,5 @@
 **不证明 KV 字节一致、全词表分布一致、activation 保真，也不覆盖 Ascend、V2 runner、并发批次、speculation/MTP、缓存淘汰/抢占、PD 分离、LoRA、多模态或 thinking 模式。**
 
 原 `scripts/replay.py` 单请求代码未被修改；多轮验证入口与复用命令见 `validation/README.md`。
+
+后续 PR #1 评审整改（最终 121 项测试及独立真实 GPU case）的结果见 `PR1_REVIEW_FIXES.md`；本报告与上面的原始数字保持历史含义，不改写为新 case 的结果。

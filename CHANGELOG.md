@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — PR #1 review fixes
+
+- Harden strict JSON diagnostic numbers, online route/internal-parameter isolation, terminal request capture, canonical sets and incremental block hashes.
+- Bound JSON nesting at 64 and return recorded HTTP 400 for recursive parse/encode/normalization failures; reject nonfinite/negative tolerance before evidence or GPU work.
+- Add safe runtime-environment restoration, pre-GPU model fingerprint/inventory checks, non-destructive replay preflight and optional API metadata.
+- Make agent subprocess cleanup unconditional, portable tempfile fixtures and explicit UTF-8; remove timing-dependent output assertions.
+- Document legacy basic-mode partial-prefill/row-move limitations; retain sidecar and strict duplicate-measurement checks rather than unverified last-wins deduplication.
+- New real CUDA/OpenCode case and APC ablation: `validation/PR1_REVIEW_FIXES.md`; original acceptance evidence remains unchanged.
+
 ## full-session-v1 — 高级／完整会话重放模式
 
 ### Added
